@@ -1,0 +1,119 @@
+// leetgpu percentile 26.4%
+
+#include <cuda_runtime.h>
+#include <cuda_fp16.h>
+#include <iostream>
+
+// 定义分块大小，通常选择 16 或 32
+// 选择 16 是为了方便适配较小的矩阵，且每个 Block 256 个线程，利用率较好
+#define BLOCK_SIZE 16
+
+/**
+ * CUDA Kernel: Tiled Matrix Multiplication
+ * C = alpha * (A * B) + beta * C
+ */
+__global__ void gemm_fp16_tiled_kernel(
+    const half* __restrict__ A, 
+    const half* __restrict__ B, 
+    half* __restrict__ C, 
+    int M, int N, int K, 
+    float alpha, float beta) 
+{
+    // 1. 计算当前线程在全局矩阵 C 中的坐标 (row, col)
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+
+    // 2. 声明共享内存用于缓存 A 和 B 的子块
+    // 大小为 BLOCK_SIZE x BLOCK_SIZE
+    __shared__ half s_A[BLOCK_SIZE][BLOCK_SIZE];
+    __shared__ half s_B[BLOCK_SIZE][BLOCK_SIZE];
+
+    // 使用 float (FP32) 进行累加，满足题目要求的 "better precision"
+    float sum = 0.0f;
+
+    // 3. 循环遍历 K 维度上的所有子块 (Tiles)
+    // 每次步进 BLOCK_SIZE 长度
+    for (int k = 0; k < K; k += BLOCK_SIZE) {
+        
+        // --- 加载数据到共享内存 ---
+        
+        // 加载 A 的子块元素: s_A[ty][tx]
+        // 对应全局内存 A[row][k + tx]
+        // 边界检查: 确保行没有超出 M，列没有超出 K
+        if (row < M && (k + threadIdx.x) < K) {
+            // 行主序索引: row * K + col
+            s_A[threadIdx.y][threadIdx.x] = A[row * K + (k + threadIdx.x)];
+        } else {
+            // 超出边界补 0，不影响计算结果
+            s_A[threadIdx.y][threadIdx.x] = __float2half(0.0f);
+        }
+
+        // 加载 B 的子块元素: s_B[ty][tx]
+        // 对应全局内存 B[k + ty][col]
+        // 边界检查: 确保行没有超出 K，列没有超出 N
+        if (col < N && (k + threadIdx.y) < K) {
+            // 行主序索引: row * N + col
+            s_B[threadIdx.y][threadIdx.x] = B[(k + threadIdx.y) * N + col];
+        } else {
+            s_B[threadIdx.y][threadIdx.x] = __float2half(0.0f);
+        }
+
+        // 同步: 确保 Block 内所有线程都完成了加载，才开始计算
+        __syncthreads();
+
+        // --- 计算当前子块的乘积 ---
+        
+        // 累加当前共享内存块中的点积
+        // 注意: 这里即使 K 不能被 BLOCK_SIZE 整除，由于上面补了0，这里循环不用变
+        #pragma unroll
+        for (int i = 0; i < BLOCK_SIZE; ++i) {
+            // 将 half 转换为 float 进行计算
+            float val_a = __half2float(s_A[threadIdx.y][i]);
+            float val_b = __half2float(s_B[i][threadIdx.x]);
+            sum += val_a * val_b;
+        }
+
+        // 同步: 确保所有线程都计算完了，才能进入下一次循环覆盖 s_A 和 s_B
+        __syncthreads();
+    }
+
+    // 4. 将结果写回全局内存 C
+    // 只需要在合法的范围内写入
+    if (row < M && col < N) {
+        // 读取 C 的旧值 (用于 beta * C)
+        int idx = row * N + col;
+        float c_old = __half2float(C[idx]);
+
+        // 计算最终结果: alpha * (A*B) + beta * C
+        float result = alpha * sum + beta * c_old;
+
+        // 转换回 half 并存储
+        C[idx] = __float2half(result);
+    }
+}
+
+/**
+ * Host function to call the kernel
+ */
+extern "C" void solve(const half* A, const half* B, half* C, int M, int N, int K, float alpha,
+                      float beta) {
+                            // 定义 Block 的维度 (16 x 16)
+    dim3 blockDim(BLOCK_SIZE, BLOCK_SIZE);
+
+    // 定义 Grid 的维度
+    // 使用向上取整公式 (N + BLOCK_SIZE - 1) / BLOCK_SIZE 确保覆盖所有元素
+    dim3 gridDim((N + BLOCK_SIZE - 1) / BLOCK_SIZE, 
+                 (M + BLOCK_SIZE - 1) / BLOCK_SIZE);
+
+    // 启动 Kernel
+    gemm_fp16_tiled_kernel<<<gridDim, blockDim>>>(A, B, C, M, N, K, alpha, beta);
+
+    // 检查 Kernel 启动错误 (可选，但在调试时很有用)
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        std::cerr << "CUDA Error: " << cudaGetErrorString(err) << std::endl;
+    }
+    
+    // 同步设备以确保计算完成 (通常在最后数据传回 CPU 前做，这里放在函数末尾显式同步)
+    cudaDeviceSynchronize();
+}
