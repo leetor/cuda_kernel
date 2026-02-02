@@ -1,0 +1,348 @@
+#include <cuda_runtime.h>
+#include <cuda_fp16.h>
+#include <iostream>
+#include <mma.h>
+#include <cuda_pipeline.h>
+
+using namespace nvcuda;
+
+// Tile sizes
+#define BM 128
+#define BN 256
+#define BK 16
+
+// ============================================================
+// Memory Swizzle 解决 Bank Conflict
+// ============================================================
+
+__device__ __forceinline__ int swizzle_a(int row, int col) {
+    int float4_idx = col >> 3;           // 0 或 1
+    int inner_offset = col & 7;          // 0-7
+    int swizzled_idx = float4_idx ^ ((row >> 2) & 1);  // 每4行切换
+    return (swizzled_idx << 3) | inner_offset;
+}
+
+
+__device__ __forceinline__ int swizzle_b(int row, int col) {
+    int float4_idx = col >> 3;           // 0-31
+    int inner_offset = col & 7;          // 0-7
+    int swizzled_idx = float4_idx ^ row; // row 是 0-15
+    return (swizzled_idx << 3) | inner_offset;
+}
+
+#ifndef OFFSET
+#define OFFSET(row, col, ld) ((row) * (ld) + (col))
+#endif
+
+// ============================================================
+// 异步加载 A tile with Swizzle
+// ============================================================
+__device__ __forceinline__ void load_a_tile_async_swizzle(
+    half s_a[][BK],
+    const half* __restrict__ a,
+    int by, int k_offset, int M, int K)
+{
+    int tid = threadIdx.x;
+    int load_row = tid / 2;
+    int load_col = (tid % 2) * 8;
+    
+    int gmem_row = by * BM + load_row;
+    int gmem_col = k_offset + load_col;
+    int swizzled_col = swizzle_a(load_row, load_col);
+    
+    if (gmem_row < M && gmem_col + 7 < K) {
+        __pipeline_memcpy_async(&s_a[load_row][swizzled_col], 
+                                &a[OFFSET(gmem_row, gmem_col, K)], 16);
+    } else {
+        // 边界情况：逐元素加载
+        #pragma unroll
+        for (int i = 0; i < 8; i++) {
+            int sw_col = swizzle_a(load_row, load_col + i);
+            half val = (gmem_row < M && gmem_col + i < K) ? 
+                       a[OFFSET(gmem_row, gmem_col + i, K)] : __float2half(0.0f);
+            s_a[load_row][sw_col] = val;
+        }
+    }
+}
+
+// ============================================================
+// 异步加载 B tile with Swizzle
+// ============================================================
+__device__ __forceinline__ void load_b_tile_async_swizzle(
+    half s_b[][BN],
+    const half* __restrict__ b,
+    int bx, int k_offset, int N, int K)
+{
+    int tid = threadIdx.x;
+    
+    #pragma unroll
+    for (int l = 0; l < 2; l++) {
+        int vec_idx = tid + l * 256;
+        int load_row = vec_idx / 32;
+        int load_col = (vec_idx % 32) * 8;
+        
+        int gmem_row = k_offset + load_row;
+        int gmem_col = bx * BN + load_col;
+        int swizzled_col = swizzle_b(load_row, load_col);
+        
+        if (gmem_row < K && gmem_col + 7 < N) {
+            __pipeline_memcpy_async(&s_b[load_row][swizzled_col],
+                                    &b[OFFSET(gmem_row, gmem_col, N)], 16);
+        } else {
+            #pragma unroll
+            for (int i = 0; i < 8; i++) {
+                int sw_col = swizzle_b(load_row, load_col + i);
+                half val = (gmem_row < K && gmem_col + i < N) ?
+                           b[OFFSET(gmem_row, gmem_col + i, N)] : __float2half(0.0f);
+                s_b[load_row][sw_col] = val;
+            }
+        }
+    }
+}
+
+
+__device__ __forceinline__ void unswizzle_a_tile(
+    half* dst,              
+    half s_a[][BK],
+    int row_offset,
+    int lane)
+{
+
+    #pragma unroll
+    for (int e = 0; e < 8; e++) {
+        int elem_idx = lane * 8 + e;
+        int r = elem_idx / 16;
+        int c = elem_idx % 16;
+        int sw_c = swizzle_a(row_offset + r, c);
+        dst[elem_idx] = s_a[row_offset + r][sw_c];
+    }
+}
+
+
+__device__ __forceinline__ void unswizzle_b_tile(
+    half* dst,             
+    half s_b[][BN],
+    int col_offset,
+    int lane)
+{
+    #pragma unroll
+    for (int e = 0; e < 8; e++) {
+        int elem_idx = lane * 8 + e;
+        int r = elem_idx / 16;  // K dim: 0-15
+        int c = elem_idx % 16;  // N dim within tile
+        int sw_c = swizzle_b(r, col_offset + c);
+        dst[elem_idx] = s_b[r][sw_c];
+    }
+}
+
+__global__ void myHGEMMAlignedV1(
+    const half * __restrict__ a, const half * __restrict__ b, half * __restrict__ c,
+    const int M, const int N, const int K, float alpha, float beta) {
+
+    int bx = blockIdx.x;
+    int by = blockIdx.y;
+    int tid = threadIdx.x;
+    int wid = tid >> 5;
+    int lane = tid & 31;
+
+    // ============ Shared Memory Layout ============
+    // Double buffer for swizzled data
+    __shared__ half s_a[2][BM][BK];     // 2 x 128 x 16 x 2 = 8192 bytes
+    __shared__ half s_b[2][BK][BN];     // 2 x 16 x 256 x 2 = 16384 bytes
+    // Temp buffer for un-swizzle (per warp, reused)
+    __shared__ half temp_a[8][16][16];  // 8 warps x 16x16 = 4096 bytes
+    __shared__ half temp_b[8][16][16];  // 8 warps x 16x16 = 4096 bytes
+    // Total: 32768 bytes < 48KB ✓
+
+    // WMMA fragments
+    wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> frag_a[4];
+    wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::row_major> frag_b[4];
+    wmma::fragment<wmma::accumulator, 16, 16, 16, float> frag_c[4][4];
+
+    #pragma unroll
+    for (int i = 0; i < 4; i++) {
+        #pragma unroll
+        for (int j = 0; j < 4; j++) {
+            wmma::fill_fragment(frag_c[i][j], 0.0f);
+        }
+    }
+
+    // Warp tile position
+    int comp_c_frag_m = wid & 1;   // 0 or 1
+    int comp_c_frag_n = wid >> 1;  // 0-3
+    int a_row_base = comp_c_frag_m * 64;
+    int b_col_base = comp_c_frag_n * 64;
+
+    int num_k_tiles = (K + BK - 1) / BK;
+
+    // ============ Prologue ============
+    load_a_tile_async_swizzle(s_a[0], a, by, 0, M, K);
+    load_b_tile_async_swizzle(s_b[0], b, bx, 0, N, K);
+    __pipeline_commit();
+    
+    if (num_k_tiles > 1) {
+        load_a_tile_async_swizzle(s_a[1], a, by, BK, M, K);
+        load_b_tile_async_swizzle(s_b[1], b, bx, BK, N, K);
+        __pipeline_commit();
+    }
+
+    // ============ Main Loop ============
+    for (int bk = 0; bk < num_k_tiles; bk++) {
+        int curr = bk % 2;
+        
+        if (bk + 1 < num_k_tiles) {
+            __pipeline_wait_prior(1);
+        } else {
+            __pipeline_wait_prior(0);
+        }
+        __syncthreads();
+
+        // ===== Un-swizzle and Load A Fragments =====
+        #pragma unroll
+        for (int fi = 0; fi < 4; fi++) {
+            int frag_row = a_row_base + fi * 16;
+            
+            // Warp 协作 un-swizzle 16x16 tile
+            unswizzle_a_tile(&temp_a[wid][0][0], s_a[curr], frag_row, lane);
+            __syncwarp();
+            
+            // 从 un-swizzled buffer 加载
+            wmma::load_matrix_sync(frag_a[fi], &temp_a[wid][0][0], 16);
+        }
+
+        // ===== Un-swizzle and Load B Fragments =====
+        #pragma unroll
+        for (int fj = 0; fj < 4; fj++) {
+            int frag_col = b_col_base + fj * 16;
+            
+            unswizzle_b_tile(&temp_b[wid][0][0], s_b[curr], frag_col, lane);
+            __syncwarp();
+            
+            wmma::load_matrix_sync(frag_b[fj], &temp_b[wid][0][0], 16);
+        }
+
+        // ===== WMMA Compute =====
+        #pragma unroll
+        for (int i = 0; i < 4; i++) {
+            #pragma unroll
+            for (int j = 0; j < 4; j++) {
+                wmma::mma_sync(frag_c[i][j], frag_a[i], frag_b[j], frag_c[i][j]);
+            }
+        }
+
+        // ===== Prefetch =====
+        int prefetch_k = bk + 2;
+        if (prefetch_k < num_k_tiles) {
+            load_a_tile_async_swizzle(s_a[curr], a, by, prefetch_k * BK, M, K);
+            load_b_tile_async_swizzle(s_b[curr], b, bx, prefetch_k * BK, N, K);
+            __pipeline_commit();
+        }
+        
+        __syncthreads();
+    }
+
+    // ================= Epilogue =================
+    int store_c_gmem_m = by * BM + comp_c_frag_m * 64;
+    int store_c_gmem_n = bx * BN + comp_c_frag_n * 64;
+
+    // Reuse temp_a as float staging (256 floats per warp = 1024 bytes)
+    float* warp_smem_f = (float*)&temp_a[wid][0][0];
+
+    #pragma unroll
+    for (int i = 0; i < 4; i++) {
+        #pragma unroll
+        for (int j = 0; j < 4; j++) {
+            int tile_row = store_c_gmem_m + i * 16;
+            int tile_col = store_c_gmem_n + j * 16;
+            
+            bool is_safe = (tile_row + 16 <= M) && (tile_col + 16 <= N);
+
+            // Apply alpha
+            #pragma unroll
+            for (int t = 0; t < frag_c[i][j].num_elements; t++) {
+                frag_c[i][j].x[t] *= alpha;
+            }
+
+            if (is_safe) {
+                half* dst_ptr = &c[OFFSET(tile_row, tile_col, N)];
+
+                if (beta != 0.0f) {
+                    wmma::fragment<wmma::accumulator, 16, 16, 16, half> frag_old_h;
+                    wmma::load_matrix_sync(frag_old_h, dst_ptr, N, wmma::mem_row_major);
+                    #pragma unroll
+                    for (int t = 0; t < frag_old_h.num_elements; t++) {
+                        frag_c[i][j].x[t] += __half2float(frag_old_h.x[t]) * beta;
+                    }
+                }
+                
+                wmma::store_matrix_sync(warp_smem_f, frag_c[i][j], 16, wmma::mem_row_major);
+                __syncwarp();
+                
+                #pragma unroll
+                for (int k = 0; k < 8; ++k) {
+                    int idx = lane + k * 32;
+                    int r = idx / 16;
+                    int col = idx % 16;
+                    c[OFFSET(tile_row + r, tile_col + col, N)] = __float2half(warp_smem_f[idx]);
+                }
+            } else {
+                if (beta != 0.0f) {
+                    #pragma unroll
+                    for (int k = 0; k < 8; ++k) {
+                        int idx = lane + k * 32;
+                        int r = idx / 16;
+                        int col = idx % 16;
+                        int gr = tile_row + r;
+                        int gc = tile_col + col;
+                        warp_smem_f[idx] = (gr < M && gc < N) ? 
+                            __half2float(c[OFFSET(gr, gc, N)]) : 0.0f;
+                    }
+                    __syncwarp();
+                    
+                    wmma::fragment<wmma::accumulator, 16, 16, 16, float> frag_old;
+                    wmma::load_matrix_sync(frag_old, warp_smem_f, 16, wmma::mem_row_major);
+                    #pragma unroll
+                    for (int t = 0; t < frag_old.num_elements; t++) {
+                        frag_c[i][j].x[t] += frag_old.x[t] * beta;
+                    }
+                }
+
+                wmma::store_matrix_sync(warp_smem_f, frag_c[i][j], 16, wmma::mem_row_major);
+                __syncwarp();
+
+                #pragma unroll
+                for (int k = 0; k < 8; ++k) {
+                    int idx = lane + k * 32;
+                    int r = idx / 16;
+                    int col = idx % 16;
+                    int gr = tile_row + r;
+                    int gc = tile_col + col;
+                    if (gr < M && gc < N) {
+                        c[OFFSET(gr, gc, N)] = __float2half(warp_smem_f[idx]);
+                    }
+                }
+            }
+        }
+    }
+}
+
+extern "C" void solve(const half* A, const half* B, half* C, int M, int N, int K, 
+                      float alpha, float beta) {
+    
+    dim3 blockDim(256);
+    dim3 gridDim((N + BN - 1) / BN, (M + BM - 1) / BM);
+
+    myHGEMMAlignedV1<<<gridDim, blockDim>>>(A, B, C, M, N, K, alpha, beta);
+
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        std::cerr << "CUDA Kernel Launch Error: " << cudaGetErrorString(err) << std::endl;
+    }
+    
+    cudaDeviceSynchronize();
+    
+    err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        std::cerr << "CUDA Kernel Execution Error: " << cudaGetErrorString(err) << std::endl;
+    }
+}
