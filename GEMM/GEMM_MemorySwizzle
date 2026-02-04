@@ -189,12 +189,10 @@ __global__ void myHGEMMAlignedV1(
     // ============ Main Loop ============
     for (int bk = 0; bk < num_k_tiles; bk++) {
         int curr = bk % 2;
+        int next_prefech = curr ^ 1;
+
+        __pipeline_wait_prior(0);
         
-        if (bk + 1 < num_k_tiles) {
-            __pipeline_wait_prior(1);
-        } else {
-            __pipeline_wait_prior(0);
-        }
         __syncthreads();
 
         // ===== Un-swizzle and Load A Fragments =====
@@ -233,12 +231,11 @@ __global__ void myHGEMMAlignedV1(
         // ===== Prefetch =====
         int prefetch_k = bk + 2;
         if (prefetch_k < num_k_tiles) {
-            load_a_tile_async_swizzle(s_a[curr], a, by, prefetch_k * BK, M, K);
-            load_b_tile_async_swizzle(s_b[curr], b, bx, prefetch_k * BK, N, K);
-            __pipeline_commit();
+            load_a_tile_async_swizzle(s_a[next_prefech], a, by, prefetch_k * BK, M, K);
+            load_b_tile_async_swizzle(s_b[next_prefech], b, bx, prefetch_k * BK, N, K);
         }
         
-        __syncthreads();
+       // __syncthreads(); 
     }
 
     // ================= Epilogue =================
