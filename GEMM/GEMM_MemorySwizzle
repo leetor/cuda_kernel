@@ -178,20 +178,11 @@ __global__ void myHGEMMAlignedV1(
     // ============ Prologue ============
     load_a_tile_async_swizzle(s_a[0], a, by, 0, M, K);
     load_b_tile_async_swizzle(s_b[0], b, bx, 0, N, K);
-    __pipeline_commit();
-    
-    if (num_k_tiles > 1) {
-        load_a_tile_async_swizzle(s_a[1], a, by, BK, M, K);
-        load_b_tile_async_swizzle(s_b[1], b, bx, BK, N, K);
-        __pipeline_commit();
-    }
 
     // ============ Main Loop ============
     for (int bk = 0; bk < num_k_tiles; bk++) {
         int curr = bk % 2;
         int next_prefech = curr ^ 1;
-
-        __pipeline_wait_prior(0);
         
         __syncthreads();
 
@@ -227,6 +218,7 @@ __global__ void myHGEMMAlignedV1(
                 wmma::mma_sync(frag_c[i][j], frag_a[i], frag_b[j], frag_c[i][j]);
             }
         }
+        // __syncthreads();  double buffering just hide this syncthreads,so we cant use the same index,prefetch the data to another index.
 
         // ===== Prefetch =====
         int prefetch_k = bk + 2;
@@ -235,7 +227,6 @@ __global__ void myHGEMMAlignedV1(
             load_b_tile_async_swizzle(s_b[next_prefech], b, bx, prefetch_k * BK, N, K);
         }
         
-       // __syncthreads(); 
     }
 
     // ================= Epilogue =================
